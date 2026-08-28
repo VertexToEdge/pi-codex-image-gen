@@ -1,40 +1,9 @@
 {
-  "name": "pi-codex-image-gen",
-  "version": "0.1.8",
-  "description": "Image generation for Pi using the ChatGPT Images 2.0 model.",
+  "name": "pi-litellm-codex-image-gen",
+  "version": "0.1.0",
+  "description": "Image generation for Pi via a self-hosted LiteLLM gateway in front of codex-proxy (gpt-image-2). Fork of jvm/pi-codex-image-gen, retargeted to call the gateway instead of chatgpt.com directly.",
   "type": "module",
   "license": "Apache-2.0",
-  "author": "jvm",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/jvm/pi-codex-image-gen.git"
-  },
-  "bugs": {
-    "url": "https://github.com/jvm/pi-codex-image-gen/issues"
-  },
-  "homepage": "https://github.com/jvm/pi-codex-image-gen#readme",
-  "keywords": [
-    "pi-package",
-    "pi-extension",
-    "pi",
-    "codex",
-    "image-generation",
-    "gpt-image-2"
-  ],
-  "files": [
-    "index.ts",
-    "skills",
-    "README.md",
-    "LICENSE",
-    "CHANGELOG.md",
-    "SECURITY.md",
-    "CONTRIBUTING.md",
-    "CODE_OF_CONDUCT.md"
-  ],
-  "scripts": {
-    "check": "tsc --noEmit",
-    "pack:dry-run": "npm pack --dry-run"
-  },
   "pi": {
     "extensions": ["./index.ts"],
     "skills": ["./skills"]
@@ -50,9 +19,6 @@
     "typebox": "^1.1.33",
     "@types/node": "^25.6.0",
     "typescript": "^6.0.3"
-  },
-  "publishConfig": {
-    "access": "public"
   },
   "engines": {
     "node": ">=20.6.0"

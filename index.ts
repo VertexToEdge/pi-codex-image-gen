@@ -1,44 +1,41 @@
 /**
- * Project-local Codex image generation extension.
+ * Project-local image generation extension for Pi.
  *
- * Registers `codex_generate_image`, a tool that uses Pi's existing
- * openai-codex ChatGPT/Codex auth to call the Codex Responses backend with the
- * native `image_generation` tool. The backend maps that tool to gpt-image-2.
+ * Registers `codex_generate_image`, a tool that calls a self-hosted LiteLLM
+ * gateway (which sits in front of codex-proxy, which holds the shared
+ * ChatGPT/Codex login) with the native `image_generation` tool. The backend
+ * maps that tool to gpt-image-2.
+ *
+ * This is a fork of jvm/pi-codex-image-gen (Apache-2.0), retargeted to call
+ * a self-hosted gateway with a plain bearer key instead of talking to
+ * chatgpt.com directly through Pi's own "openai-codex" provider login. That
+ * means usage is attributed to this server's own gateway key and can be
+ * throttled/monitored centrally, instead of requiring every server running
+ * Pi to hold its own ChatGPT session. Install-telemetry reporting from the
+ * upstream package has been removed (it phoned home to the original
+ * author's own endpoint; not appropriate to carry over into a fork that
+ * talks to a different backend).
+ *
+ * Gateway URL and API key are NOT configured separately here -- they're
+ * read from Pi's currently active chat model (`ctx.model.baseUrl` /
+ * `ctx.modelRegistry.getProviderAuth(ctx.model.provider)`), i.e. whatever
+ * provider/model you already have Pi's chat pointed at. Point Pi's model at
+ * the gateway (e.g. a custom provider with baseUrl
+ * https://litellm.verte.kr/v1 and one of the server1..server6 keys) and
+ * this tool automatically follows it -- one place to configure, not two.
  */
 
 import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 
-const PACKAGE_NAME = "pi-codex-image-gen";
-const PROVIDER = "openai-codex";
-const DEFAULT_MODEL = "gpt-5.5";
-const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
-const JWT_CLAIM_PATH = "https://api.openai.com/auth";
+const CONFIG_FILENAME = "litellm-codex-image-gen.json";
 const DEFAULT_SAVE_MODE = "global";
-const OPENAI_BETA_HEADER = "responses=experimental";
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
-const INSTALL_TELEMETRY_URL = "https://mocito.dev/api/report-install";
-const INSTALL_TELEMETRY_TIMEOUT_MS = 5000;
-const CI_ENV_VARS = [
-	"CI",
-	"GITHUB_ACTIONS",
-	"GITLAB_CI",
-	"CIRCLECI",
-	"BUILDKITE",
-	"JENKINS_URL",
-	"TEAMCITY_VERSION",
-	"TF_BUILD",
-	"BITBUCKET_BUILD_NUMBER",
-	"APPVEYOR",
-	"TRAVIS",
-	"DRONE",
-	"CODEBUILD_BUILD_ID",
-] as const;
 
 const SAVE_MODES = ["none", "project", "global", "custom"] as const;
 type SaveMode = (typeof SAVE_MODES)[number];
@@ -46,7 +43,7 @@ type SaveMode = (typeof SAVE_MODES)[number];
 const OUTPUT_FORMATS = ["png", "jpeg", "webp"] as const;
 type OutputFormat = (typeof OUTPUT_FORMATS)[number];
 
-// --- #1: Retry helpers with exponential backoff + jitter ---
+// --- Retry helpers with exponential backoff + jitter ---
 
 function isRetryableStatus(status: number, errorText: string): boolean {
 	if ([429, 500, 502, 503, 504].includes(status)) return true;
@@ -54,7 +51,7 @@ function isRetryableStatus(status: number, errorText: string): boolean {
 }
 
 function backoffMs(attempt: number): number {
-	const jitter = 0.9 + Math.random() * 0.2; // matches codex-rs jitter range
+	const jitter = 0.9 + Math.random() * 0.2;
 	return BASE_DELAY_MS * 2 ** (attempt - 1) * jitter;
 }
 
@@ -63,7 +60,7 @@ function backoffMs(attempt: number): number {
 const TOOL_PARAMS = Type.Object({
 	prompt: Type.String({ description: "The image prompt. Be specific about subject, composition, style, text, and constraints." }),
 	model: Type.Optional(
-		Type.String({ description: `Codex model that should invoke image generation. Defaults to ${DEFAULT_MODEL}.` }),
+		Type.String({ description: "Gateway model name that should invoke image generation. Defaults to Pi's currently active model." }),
 	),
 	outputFormat: Type.Optional(StringEnum(OUTPUT_FORMATS)),
 	save: Type.Optional(StringEnum(SAVE_MODES)),
@@ -81,7 +78,6 @@ type ToolParams = Static<typeof TOOL_PARAMS>;
 interface ExtensionConfig {
 	save?: SaveMode;
 	saveDir?: string;
-	model?: string;
 }
 
 interface SaveConfig {
@@ -96,20 +92,14 @@ interface GeneratedImage {
 	revisedPrompt?: string;
 }
 
-interface ParsedCodexResponse {
+interface ParsedResponse {
 	image?: GeneratedImage;
 	text: string[];
 	responseId?: string;
 	usage?: unknown;
 }
 
-interface InstallTelemetryState {
-	lastReportedVersion?: string;
-}
-
-// --- #11: Typed SSE event discriminated union ---
-
-type CodexSseEvent =
+type SseEvent =
 	| { type: "error"; message?: string; code?: string }
 	| { type: "response.failed"; response?: { error?: { message?: string } } }
 	| { type: "response.created"; response?: { id?: string } }
@@ -126,34 +116,7 @@ type CodexSseEvent =
 	  }
 	| { type: "response.completed"; response?: { id?: string; usage?: unknown } };
 
-// --- JWT helpers ---
-
-function decodeJwtPayload(token: string): Record<string, unknown> {
-	const parts = token.split(".");
-	if (parts.length !== 3 || !parts[1]) {
-		throw new Error("OpenAI Codex auth token is not a JWT. Run /login for openai-codex again.");
-	}
-	try {
-		return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as Record<string, unknown>;
-	} catch (error) {
-		throw new Error(`Failed to decode OpenAI Codex auth token: ${error instanceof Error ? error.message : String(error)}`);
-	}
-}
-
-function extractChatGptAccountId(token: string): string {
-	const payload = decodeJwtPayload(token);
-	const authClaims = payload[JWT_CLAIM_PATH];
-	if (!authClaims || typeof authClaims !== "object") {
-		throw new Error("OpenAI Codex auth token does not contain ChatGPT auth claims. Run /login for openai-codex again.");
-	}
-	const accountId = (authClaims as Record<string, unknown>).chatgpt_account_id;
-	if (typeof accountId !== "string" || accountId.length === 0) {
-		throw new Error("OpenAI Codex auth token does not contain chatgpt_account_id. Run /login for openai-codex again.");
-	}
-	return accountId;
-}
-
-// --- #10: try/catch readConfigFile replaces racy existsSync + readFileSync ---
+// --- Config loading ---
 
 function readConfigFile(path: string): ExtensionConfig {
 	try {
@@ -164,66 +127,19 @@ function readConfigFile(path: string): ExtensionConfig {
 }
 
 function loadConfig(cwd: string): ExtensionConfig {
-	const globalConfig = readConfigFile(join(getAgentDir(), "extensions", "codex-image-gen.json"));
-	const projectConfig = readConfigFile(join(cwd, ".pi", "extensions", "codex-image-gen.json"));
+	const globalConfig = readConfigFile(join(getAgentDir(), "extensions", CONFIG_FILENAME));
+	const projectConfig = readConfigFile(join(cwd, ".pi", "extensions", CONFIG_FILENAME));
 	return { ...globalConfig, ...projectConfig };
 }
 
-function isTruthyEnvFlag(value: string | undefined): boolean {
-	if (!value) return false;
-	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
-}
-
-function isCiEnvironment(): boolean {
-	return CI_ENV_VARS.some((name) => {
-		const value = process.env[name];
-		return value !== undefined && value !== "" && value !== "0" && value.toLowerCase() !== "false";
-	});
-}
-
-function isInstallTelemetryEnabled(): boolean {
-	if (isCiEnvironment()) return false;
-	if (isTruthyEnvFlag(process.env.PI_OFFLINE)) return false;
-	if (process.env.PI_TELEMETRY !== undefined) return isTruthyEnvFlag(process.env.PI_TELEMETRY);
-	const settings = readConfigFile(join(getAgentDir(), "settings.json")) as { enableInstallTelemetry?: unknown };
-	return settings.enableInstallTelemetry !== false;
-}
-
-function getPackageVersion(): string {
-	try {
-		const packageJson = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as { version?: unknown };
-		return typeof packageJson.version === "string" && packageJson.version.length > 0 ? packageJson.version : "0.0.0";
-	} catch {
-		return "0.0.0";
+// ctx.model.baseUrl is the provider's base (e.g. "https://litellm.verte.kr/v1",
+// however Pi's active model/provider is configured -- no trailing slash
+// assumed). Append /responses, tolerating either form.
+function resolveResponsesUrl(baseUrl: string): string {
+	if (!baseUrl) {
+		throw new Error("Pi's active model has no baseUrl. Point Pi's chat model at the gateway before using codex_generate_image.");
 	}
-}
-
-function getInstallTelemetryUserAgent(version: string): string {
-	const runtimeVersions = process.versions as NodeJS.ProcessVersions & { bun?: string };
-	const runtime = runtimeVersions.bun ? `bun/${runtimeVersions.bun}` : `node/${process.version}`;
-	return `${PACKAGE_NAME}/${version} (${process.platform}; ${runtime}; ${process.arch})`;
-}
-
-async function reportInstallTelemetry(): Promise<void> {
-	try {
-		if (!isInstallTelemetryEnabled()) return;
-
-		const version = getPackageVersion();
-		const statePath = join(getAgentDir(), "extensions", "codex-image-gen-install.json");
-		const state = readConfigFile(statePath) as InstallTelemetryState;
-		if (state.lastReportedVersion === version) return;
-
-		await mkdir(join(getAgentDir(), "extensions"), { recursive: true });
-		await writeFile(statePath, `${JSON.stringify({ lastReportedVersion: version }, null, 2)}\n`);
-
-		const params = new URLSearchParams({ tool: PACKAGE_NAME, version });
-		await fetch(`${INSTALL_TELEMETRY_URL}?${params.toString()}`, {
-			headers: { "User-Agent": getInstallTelemetryUserAgent(version) },
-			signal: AbortSignal.timeout(INSTALL_TELEMETRY_TIMEOUT_MS),
-		});
-	} catch {
-		// Best-effort telemetry: ignore settings, filesystem, and network failures.
-	}
+	return `${baseUrl.replace(/\/+$/, "")}/responses`;
 }
 
 // --- Path helpers ---
@@ -241,10 +157,8 @@ function sanitizePathPart(value: string, fallback: string): string {
 	return sanitized || fallback;
 }
 
-// --- #5: resolveSaveConfig accepts pre-loaded config (no double loadConfig) ---
-
 function resolveSaveConfig(params: ToolParams, cwd: string, sessionId: string, config: ExtensionConfig): SaveConfig {
-	const envMode = process.env.PI_CODEX_IMAGE_SAVE_MODE?.toLowerCase();
+	const envMode = process.env.PI_LITELLM_IMAGE_SAVE_MODE?.toLowerCase();
 	const mode = (params.save || envMode || config.save || DEFAULT_SAVE_MODE) as SaveMode;
 	const safeSessionId = sanitizePathPart(sessionId, "session");
 	if (!SAVE_MODES.includes(mode)) {
@@ -257,9 +171,9 @@ function resolveSaveConfig(params: ToolParams, cwd: string, sessionId: string, c
 		return { mode, outputDir: join(getAgentDir(), "generated-images", safeSessionId) };
 	}
 	if (mode === "custom") {
-		const configuredDir = params.saveDir || process.env.PI_CODEX_IMAGE_SAVE_DIR || config.saveDir;
+		const configuredDir = params.saveDir || process.env.PI_LITELLM_IMAGE_SAVE_DIR || config.saveDir;
 		if (!configuredDir || !configuredDir.trim()) {
-			throw new Error("save=custom requires saveDir or PI_CODEX_IMAGE_SAVE_DIR.");
+			throw new Error("save=custom requires saveDir or PI_LITELLM_IMAGE_SAVE_DIR.");
 		}
 		return { mode, outputDir: join(resolveUnderCwd(cwd, configuredDir), safeSessionId) };
 	}
@@ -287,15 +201,12 @@ async function saveImage(base64Data: string, outputFormat: OutputFormat, outputD
 }
 
 // --- Request building ---
-// #2: prompt_cache_key set to sessionId
-// #7: parallel_tool_calls: false
-// #14: include removed (not needed without reasoning)
 
 function buildRequestBody(params: ToolParams, model: string, outputFormat: OutputFormat, sessionId: string) {
 	return {
 		model,
 		store: false,
-		stream: true,
+		stream: true, // required: the gateway's /v1/responses only relays cleanly in streaming mode
 		prompt_cache_key: sessionId,
 		instructions:
 			"You are generating bitmap image assets. For this request, call the image_generation tool exactly once. Do not answer with only text unless image generation is unavailable.",
@@ -324,12 +235,12 @@ function parseSseDataLines(chunk: string): string | undefined {
 	return data && data !== "[DONE]" ? data : undefined;
 }
 
-async function parseCodexSse(response: Response, signal?: AbortSignal): Promise<ParsedCodexResponse> {
-	if (!response.body) throw new Error("Codex response did not include a stream body.");
+async function parseResponseSse(response: Response, signal?: AbortSignal): Promise<ParsedResponse> {
+	if (!response.body) throw new Error("Gateway response did not include a stream body.");
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
 	let buffer = "";
-	const parsed: ParsedCodexResponse = { text: [] };
+	const parsed: ParsedResponse = { text: [] };
 
 	try {
 		while (true) {
@@ -343,12 +254,12 @@ async function parseCodexSse(response: Response, signal?: AbortSignal): Promise<
 				const chunk = buffer.slice(0, separator);
 				buffer = buffer.slice(separator + 2);
 				const data = parseSseDataLines(chunk);
-				if (data) handleCodexEvent(JSON.parse(data) as CodexSseEvent, parsed);
+				if (data) handleSseEvent(JSON.parse(data) as SseEvent, parsed);
 				separator = buffer.indexOf("\n\n");
 			}
 		}
 		const remaining = parseSseDataLines(buffer);
-		if (remaining) handleCodexEvent(JSON.parse(remaining) as CodexSseEvent, parsed);
+		if (remaining) handleSseEvent(JSON.parse(remaining) as SseEvent, parsed);
 	} finally {
 		try {
 			await reader.cancel();
@@ -361,40 +272,34 @@ async function parseCodexSse(response: Response, signal?: AbortSignal): Promise<
 	return parsed;
 }
 
-// --- #11: Typed event handler via discriminated union ---
-
-function handleCodexEvent(event: CodexSseEvent, parsed: ParsedCodexResponse): void {
+function handleSseEvent(event: SseEvent, parsed: ParsedResponse): void {
 	if (!event || typeof event !== "object") return;
 
 	switch (event.type) {
 		case "error": {
-			const e = event as Extract<CodexSseEvent, { type: "error" }>;
-			throw new Error(`Codex error: ${e.message || e.code || JSON.stringify(event)}`);
+			const e = event as Extract<SseEvent, { type: "error" }>;
+			throw new Error(`Gateway error: ${e.message || e.code || JSON.stringify(event)}`);
 		}
 		case "response.failed": {
-			const e = event as Extract<CodexSseEvent, { type: "response.failed" }>;
-			throw new Error(e.response?.error?.message || "Codex response failed.");
+			const e = event as Extract<SseEvent, { type: "response.failed" }>;
+			throw new Error(e.response?.error?.message || "Response failed.");
 		}
 		case "response.created": {
-			const e = event as Extract<CodexSseEvent, { type: "response.created" }>;
-			if (typeof e.response?.id === "string") {
-				parsed.responseId = e.response.id;
-			}
+			const e = event as Extract<SseEvent, { type: "response.created" }>;
+			if (typeof e.response?.id === "string") parsed.responseId = e.response.id;
 			break;
 		}
 		case "response.output_text.delta": {
-			const e = event as Extract<CodexSseEvent, { type: "response.output_text.delta" }>;
-			if (typeof e.delta === "string") {
-				parsed.text.push(e.delta);
-			}
+			const e = event as Extract<SseEvent, { type: "response.output_text.delta" }>;
+			if (typeof e.delta === "string") parsed.text.push(e.delta);
 			break;
 		}
 		case "response.output_item.done": {
-			const e = event as Extract<CodexSseEvent, { type: "response.output_item.done" }>;
+			const e = event as Extract<SseEvent, { type: "response.output_item.done" }>;
 			const item = e.item;
 			if (item?.type === "image_generation_call") {
 				if (typeof item.result !== "string" || item.result.length === 0) {
-					throw new Error("Codex image_generation_call did not contain image data.");
+					throw new Error("image_generation_call did not contain image data.");
 				}
 				parsed.image = {
 					id: String(item.id || "image_generation"),
@@ -406,7 +311,7 @@ function handleCodexEvent(event: CodexSseEvent, parsed: ParsedCodexResponse): vo
 			break;
 		}
 		case "response.completed": {
-			const e = event as Extract<CodexSseEvent, { type: "response.completed" }>;
+			const e = event as Extract<SseEvent, { type: "response.completed" }>;
 			if (typeof e.response?.id === "string") parsed.responseId = e.response.id;
 			if (e.response?.usage) parsed.usage = e.response.usage;
 			break;
@@ -414,23 +319,20 @@ function handleCodexEvent(event: CodexSseEvent, parsed: ParsedCodexResponse): vo
 	}
 }
 
-// --- #1: requestImage with retry + backoff + jitter ---
+// --- Gateway call with retry + backoff + jitter ---
 
 async function requestImage(
 	params: ToolParams,
-	token: string,
-	accountId: string,
+	gatewayUrl: string,
+	apiKey: string,
 	model: string,
 	outputFormat: OutputFormat,
 	sessionId: string,
 	signal?: AbortSignal,
-): Promise<ParsedCodexResponse> {
+): Promise<ParsedResponse> {
 	const body = JSON.stringify(buildRequestBody(params, model, outputFormat, sessionId));
 	const headers: Record<string, string> = {
-		Authorization: `Bearer ${token}`,
-		"chatgpt-account-id": accountId,
-		originator: "pi",
-		"OpenAI-Beta": OPENAI_BETA_HEADER,
+		Authorization: `Bearer ${apiKey}`,
 		accept: "text/event-stream",
 		"content-type": "application/json",
 	};
@@ -438,12 +340,7 @@ async function requestImage(
 	for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
 		if (signal?.aborted) throw new Error("Image generation was aborted.");
 
-		const response = await fetch(CODEX_RESPONSES_URL, {
-			method: "POST",
-			headers,
-			body,
-			signal,
-		});
+		const response = await fetch(gatewayUrl, { method: "POST", headers, body, signal });
 
 		if (!response.ok) {
 			const errorText = await response.text();
@@ -452,73 +349,75 @@ async function requestImage(
 				await new Promise<void>((resolve) => setTimeout(resolve, delay));
 				continue;
 			}
-			throw new Error(`Codex image generation request failed (${response.status}): ${errorText}`);
+			throw new Error(`Gateway image generation request failed (${response.status}): ${errorText}`);
 		}
 
-		return parseCodexSse(response, signal);
+		return parseResponseSse(response, signal);
 	}
 
-	throw new Error("Codex image generation request failed after all retries.");
+	throw new Error("Gateway image generation request failed after all retries.");
 }
 
 // --- Extension entry point ---
 
-export default function codexImageGen(pi: ExtensionAPI) {
-	void reportInstallTelemetry();
-
+export default function litellmCodexImageGen(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "codex_generate_image",
-		label: "Codex Image",
+		label: "Gateway Image",
 		description:
-			"Generate an image with the OpenAI Codex ChatGPT backend built-in image_generation tool (gpt-image-2). Uses the existing openai-codex login; does not require OPENAI_API_KEY.",
-		promptSnippet: "Generate bitmap images via the OpenAI Codex ChatGPT backend gpt-image-2 image_generation tool.",
+			"Generate an image via the self-hosted LiteLLM gateway's codex image_generation tool (backed by gpt-image-2). " +
+			"Uses this server's own gateway API key; does not require OPENAI_API_KEY or a local ChatGPT login.",
+		promptSnippet: "Generate bitmap images via the gateway's gpt-image-2 image_generation tool.",
 		promptGuidelines: [
-			"Use codex_generate_image when the user asks to generate a raster image, illustration, photo, sprite, icon draft, banner, or other bitmap asset with OpenAI/Codex image generation.",
-			"Do not use codex_generate_image without a clear image-generation request, because it consumes the user's Codex image quota.",
+			"Use codex_generate_image when the user asks to generate a raster image, illustration, photo, sprite, icon draft, banner, or other bitmap asset.",
+			"Do not use codex_generate_image without a clear image-generation request, because it consumes shared image quota tracked centrally on the gateway.",
 		],
 		parameters: TOOL_PARAMS,
-		executionMode: "parallel", // #4: safe to run concurrently — no shared state, saves serialized per-path
+		executionMode: "parallel",
 		async execute(toolCallId, params: ToolParams, signal, onUpdate, ctx) {
 			const outputFormat = params.outputFormat || "png";
-			const config = loadConfig(ctx.cwd); // #5: load once, pass to resolveSaveConfig
-			const requestedModel = params.model || config.model || DEFAULT_MODEL;
-			const model = ctx.modelRegistry.find(PROVIDER, requestedModel)?.id || requestedModel; // #6: removed dead FALLBACK_MODEL
-			const token = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
-			if (!token) {
-				throw new Error(`Missing ${PROVIDER} credentials. Run /login and select ChatGPT Plus/Pro (Codex).`);
+			const config = loadConfig(ctx.cwd);
+
+			// Reuse whatever provider/model Pi's chat is currently pointed at,
+			// instead of a separately configured gateway URL/key. ctx.model is
+			// the active model; its baseUrl is the provider's API base, and
+			// getProviderAuth resolves the credential currently in effect for
+			// that provider (API key, stored credential, OAuth, etc).
+			if (!ctx.model) {
+				throw new Error("No active model on this session -- select a model in Pi before using codex_generate_image.");
 			}
-			const accountId = extractChatGptAccountId(token);
+			const gatewayUrl = resolveResponsesUrl(ctx.model.baseUrl);
+			const providerAuth = await ctx.modelRegistry.getProviderAuth(ctx.model.provider);
+			const apiKey = providerAuth?.auth.apiKey;
+			if (!apiKey) {
+				throw new Error(`No API key resolved for provider "${ctx.model.provider}". Check Pi's model/provider auth setup.`);
+			}
+			const model = params.model || ctx.model.id;
 			const sessionId = ctx.sessionManager.getSessionId();
 
 			onUpdate?.({
-				content: [{ type: "text", text: `Requesting gpt-image-2 generation through ${PROVIDER}/${model}...` }],
-				details: { provider: PROVIDER, model, outputFormat },
+				content: [{ type: "text", text: `Requesting gpt-image-2 generation through gateway/${model}...` }],
+				details: { gatewayUrl, model, outputFormat },
 			});
 
-			const parsed = await requestImage(params, token, accountId, model, outputFormat, sessionId, signal);
+			const parsed = await requestImage(params, gatewayUrl, apiKey, model, outputFormat, sessionId, signal);
 			if (!parsed.image) {
 				const text = parsed.text.join("").trim();
-				throw new Error(text ? `Codex did not return an image. Response text: ${text}` : "Codex did not return an image.");
+				throw new Error(text ? `Gateway did not return an image. Response text: ${text}` : "Gateway did not return an image.");
 			}
 
 			const saveConfig = resolveSaveConfig(params, ctx.cwd, sessionId, config);
 			let savedPath: string | undefined;
 			if (saveConfig.mode !== "none" && saveConfig.outputDir) {
 				savedPath = await saveImage(parsed.image.result, outputFormat, saveConfig.outputDir, parsed.image.id || toolCallId);
-				// #12: second onUpdate after save with path + byte count
 				onUpdate?.({
 					content: [{ type: "text", text: `Image saved to ${savedPath}.` }],
-					details: {
-						provider: PROVIDER,
-						model,
-						savedPath,
-						byteCount: Buffer.byteLength(parsed.image.result, "base64"),
-					},
+					details: { model, savedPath, byteCount: Buffer.byteLength(parsed.image.result, "base64") },
 				});
 			}
 
 			const summary = [
-				`Generated image via ${PROVIDER}/${model} using backend gpt-image-2.`,
+				`Generated image via gateway/${model} using backend gpt-image-2.`,
 				`Status: ${parsed.image.status}.`,
 				parsed.image.revisedPrompt ? `Revised prompt: ${parsed.image.revisedPrompt}` : undefined,
 				savedPath ? `Saved image to: ${savedPath}` : "Image was not saved to disk.",
@@ -532,7 +431,6 @@ export default function codexImageGen(pi: ExtensionAPI) {
 					{ type: "image", data: parsed.image.result, mimeType: mimeForFormat(outputFormat) },
 				],
 				details: {
-					provider: PROVIDER,
 					model,
 					backendImageModel: "gpt-image-2",
 					outputFormat,
