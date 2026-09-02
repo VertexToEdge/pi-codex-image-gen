@@ -376,20 +376,16 @@ export default function litellmCodexImageGen(pi: ExtensionAPI) {
 			const outputFormat = params.outputFormat || "png";
 			const config = loadConfig(ctx.cwd);
 
-			// Reuse whatever provider/model Pi's chat is currently pointed at,
-			// instead of a separately configured gateway URL/key. ctx.model is
-			// the active model; its baseUrl is the provider's API base, and
-			// getProviderAuth resolves the credential currently in effect for
-			// that provider (API key, stored credential, OAuth, etc).
+			// Reuse the active model's provider route and resolved request credentials.
 			if (!ctx.model) {
 				throw new Error("No active model on this session -- select a model in Pi before using codex_generate_image.");
 			}
 			const gatewayUrl = resolveResponsesUrl(ctx.model.baseUrl);
-			const providerAuth = await ctx.modelRegistry.getProviderAuth(ctx.model.provider);
-			const apiKey = providerAuth?.auth.apiKey;
-			if (!apiKey) {
-				throw new Error(`No API key resolved for provider "${ctx.model.provider}". Check Pi's model/provider auth setup.`);
+			const providerAuth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+			if (!providerAuth.ok) {
+				throw new Error(providerAuth.error);
 			}
+			const apiKey = providerAuth.apiKey;
 			const model = params.model || ctx.model.id;
 			const sessionId = ctx.sessionManager.getSessionId();
 
