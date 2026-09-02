@@ -26,7 +26,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -42,6 +42,13 @@ type SaveMode = (typeof SAVE_MODES)[number];
 
 const OUTPUT_FORMATS = ["png", "jpeg", "webp"] as const;
 type OutputFormat = (typeof OUTPUT_FORMATS)[number];
+
+const IMAGE_ACTIONS = ["auto", "generate", "edit"] as const;
+type ImageAction = (typeof IMAGE_ACTIONS)[number];
+
+const MAX_INPUT_IMAGES = 10;
+const MAX_INPUT_IMAGE_BYTES = 50 * 1024 * 1024;
+const MAX_TOTAL_INPUT_BYTES = 50 * 1024 * 1024;
 
 // --- Retry helpers with exponential backoff + jitter ---
 
@@ -61,6 +68,18 @@ const TOOL_PARAMS = Type.Object({
 	prompt: Type.String({ description: "The image prompt. Be specific about subject, composition, style, text, and constraints." }),
 	model: Type.Optional(
 		Type.String({ description: "Gateway model name that should invoke image generation. Defaults to Pi's currently active model." }),
+	),
+	action: Type.Optional(
+		StringEnum(IMAGE_ACTIONS, {
+			description: "Image operation. Defaults to edit when inputImages are supplied, otherwise generate.",
+		}),
+	),
+	inputImages: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Local image paths used as edit or reference inputs. Relative paths resolve under the current workspace.",
+			minItems: 1,
+			maxItems: MAX_INPUT_IMAGES,
+		}),
 	),
 	outputFormat: Type.Optional(StringEnum(OUTPUT_FORMATS)),
 	save: Type.Optional(StringEnum(SAVE_MODES)),
@@ -97,6 +116,12 @@ interface ParsedResponse {
 	text: string[];
 	responseId?: string;
 	usage?: unknown;
+}
+
+interface ResolvedInputImage {
+	path: string;
+	mimeType: string;
+	dataUrl: string;
 }
 
 type SseEvent =
@@ -180,6 +205,67 @@ function resolveSaveConfig(params: ToolParams, cwd: string, sessionId: string, c
 	return { mode };
 }
 
+function sniffImageMime(bytes: Uint8Array): string | undefined {
+	if (
+		bytes.length >= 8 &&
+		bytes[0] === 0x89 &&
+		bytes[1] === 0x50 &&
+		bytes[2] === 0x4e &&
+		bytes[3] === 0x47 &&
+		bytes[4] === 0x0d &&
+		bytes[5] === 0x0a &&
+		bytes[6] === 0x1a &&
+		bytes[7] === 0x0a
+	) {
+		return "image/png";
+	}
+	if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+		return "image/jpeg";
+	}
+	if (
+		bytes.length >= 12 &&
+		String.fromCharCode(...bytes.subarray(0, 4)) === "RIFF" &&
+		String.fromCharCode(...bytes.subarray(8, 12)) === "WEBP"
+	) {
+		return "image/webp";
+	}
+	if (bytes.length >= 6) {
+		const signature = String.fromCharCode(...bytes.subarray(0, 6));
+		if (signature === "GIF87a" || signature === "GIF89a") return "image/gif";
+	}
+	return undefined;
+}
+
+async function resolveInputImages(paths: string[] | undefined, cwd: string): Promise<ResolvedInputImage[]> {
+	if (!paths?.length) return [];
+	if (paths.length > MAX_INPUT_IMAGES) {
+		throw new Error(`At most ${MAX_INPUT_IMAGES} input images are supported per request.`);
+	}
+
+	const resolved: ResolvedInputImage[] = [];
+	let totalBytes = 0;
+	for (const inputPath of paths) {
+		const absolutePath = resolveUnderCwd(cwd, inputPath);
+		const metadata = await stat(absolutePath);
+		if (!metadata.isFile()) throw new Error(`Input image is not a file: ${absolutePath}`);
+		if (metadata.size >= MAX_INPUT_IMAGE_BYTES) {
+			throw new Error(`Input image must be smaller than 50 MB: ${absolutePath}`);
+		}
+		totalBytes += metadata.size;
+		if (totalBytes >= MAX_TOTAL_INPUT_BYTES) {
+			throw new Error("Combined input images must be smaller than 50 MB.");
+		}
+
+		const bytes = await readFile(absolutePath);
+		const mimeType = sniffImageMime(bytes);
+		if (!mimeType) {
+			throw new Error(`Unsupported input image format: ${absolutePath}. Expected PNG, JPEG, WebP, or GIF.`);
+		}
+		resolved.push({ path: absolutePath, mimeType, dataUrl: `data:${mimeType};base64,${bytes.toString("base64")}` });
+	}
+	return resolved;
+}
+
 // --- Image save helpers ---
 
 function extensionForFormat(outputFormat: OutputFormat): string {
@@ -200,21 +286,27 @@ async function saveImage(base64Data: string, outputFormat: OutputFormat, outputD
 
 // --- Request building ---
 
-function buildRequestBody(params: ToolParams, model: string, outputFormat: OutputFormat, sessionId: string) {
+function buildRequestBody(
+	params: ToolParams,
+	model: string,
+	outputFormat: OutputFormat,
+	sessionId: string,
+	inputImages: ResolvedInputImage[],
+) {
+	const action: ImageAction = params.action || (inputImages.length > 0 ? "edit" : "generate");
+	const content = [
+		{ type: "input_text", text: params.prompt },
+		...inputImages.map(image => ({ type: "input_image", image_url: image.dataUrl, detail: "auto" })),
+	];
 	return {
 		model,
 		store: false,
 		stream: true, // required: the gateway's /v1/responses only relays cleanly in streaming mode
 		prompt_cache_key: sessionId,
 		instructions:
-			"You are generating bitmap image assets. For this request, call the image_generation tool exactly once. Do not answer with only text unless image generation is unavailable.",
-		input: [
-			{
-				role: "user",
-				content: [{ type: "input_text", text: params.prompt }],
-			},
-		],
-		tools: [{ type: "image_generation", output_format: outputFormat }],
+			"You are generating or editing bitmap image assets. For this request, call the image_generation tool exactly once. Preserve requested reference-image details during edits. Do not answer with only text unless image generation is unavailable.",
+		input: [{ role: "user", content }],
+		tools: [{ type: "image_generation", action, output_format: outputFormat }],
 		tool_choice: "auto",
 		parallel_tool_calls: false,
 		text: { verbosity: "low" },
@@ -326,9 +418,10 @@ async function requestImage(
 	model: string,
 	outputFormat: OutputFormat,
 	sessionId: string,
+	inputImages: ResolvedInputImage[],
 	signal?: AbortSignal,
 ): Promise<ParsedResponse> {
-	const body = JSON.stringify(buildRequestBody(params, model, outputFormat, sessionId));
+	const body = JSON.stringify(buildRequestBody(params, model, outputFormat, sessionId, inputImages));
 	const headers: Record<string, string> = {
 		Authorization: `Bearer ${apiKey}`,
 		accept: "text/event-stream",
@@ -363,11 +456,13 @@ export default function litellmCodexImageGen(pi: ExtensionAPI) {
 		name: "codex_generate_image",
 		label: "Gateway Image",
 		description:
-			"Generate an image via the self-hosted LiteLLM gateway's codex image_generation tool (backed by gpt-image-2). " +
+			"Generate or edit images via the self-hosted LiteLLM gateway's codex image_generation tool (backed by gpt-image-2). " +
+			"Local inputImages are encoded as Responses API image inputs for image-to-image edits and reference workflows. " +
 			"Uses this server's own gateway API key; does not require OPENAI_API_KEY or a local ChatGPT login.",
-		promptSnippet: "Generate bitmap images via the gateway's gpt-image-2 image_generation tool.",
+		promptSnippet: "Generate or edit bitmap images via the gateway's gpt-image-2 image_generation tool.",
 		promptGuidelines: [
-			"Use codex_generate_image when the user asks to generate a raster image, illustration, photo, sprite, icon draft, banner, or other bitmap asset.",
+			"Use codex_generate_image when the user asks to generate or edit a raster image, illustration, photo, sprite, icon draft, banner, or other bitmap asset.",
+			"For image-to-image work, pass each source path through inputImages and describe each image's role in the prompt.",
 			"Do not use codex_generate_image without a clear image-generation request, because it consumes shared image quota tracked centrally on the gateway.",
 		],
 		parameters: TOOL_PARAMS,
@@ -386,15 +481,20 @@ export default function litellmCodexImageGen(pi: ExtensionAPI) {
 				throw new Error(providerAuth.error);
 			}
 			const apiKey = providerAuth.apiKey;
+			if (!apiKey) {
+				throw new Error(`No API key resolved for provider "${ctx.model.provider}".`);
+			}
 			const model = params.model || ctx.model.id;
 			const sessionId = ctx.sessionManager.getSessionId();
+			const inputImages = await resolveInputImages(params.inputImages, ctx.cwd);
+			const action: ImageAction = params.action || (inputImages.length > 0 ? "edit" : "generate");
 
 			onUpdate?.({
-				content: [{ type: "text", text: `Requesting gpt-image-2 generation through gateway/${model}...` }],
-				details: { gatewayUrl, model, outputFormat },
+				content: [{ type: "text", text: `Requesting gpt-image-2 ${action} through gateway/${model}...` }],
+				details: { gatewayUrl, model, outputFormat, action, inputImageCount: inputImages.length },
 			});
 
-			const parsed = await requestImage(params, gatewayUrl, apiKey, model, outputFormat, sessionId, signal);
+			const parsed = await requestImage(params, gatewayUrl, apiKey, model, outputFormat, sessionId, inputImages, signal);
 			if (!parsed.image) {
 				const text = parsed.text.join("").trim();
 				throw new Error(text ? `Gateway did not return an image. Response text: ${text}` : "Gateway did not return an image.");
