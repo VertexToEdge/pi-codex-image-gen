@@ -6,6 +6,13 @@ This project follows the spirit of [Keep a Changelog](https://keepachangelog.com
 
 ## [Unreleased]
 
+### Changed
+
+- Rename the npm package to `pi-codex-compatible-image-gen`.
+
+- Allow selecting gateway image routes `gpt-image-2.5-flare` and `gpt-image-2.5-sunburst` through the tool's `model` parameter; forward the selected route unchanged.
+
+
 ## [0.1.8] - 2026-05-10
 
 ### Fixed

@@ -1,10 +1,10 @@
 /**
  * Project-local image generation extension for Pi.
  *
- * Registers `codex_generate_image`, a tool that calls a self-hosted LiteLLM
- * gateway (which sits in front of codex-proxy, which holds the shared
- * ChatGPT/Codex login) with the native `image_generation` tool. The backend
- * maps that tool to gpt-image-2.
+ * Registers `codex_generate_image`, a tool that calls the configured LiteLLM
+ * gateway's Responses API with the native `image_generation` tool. The model
+ * selected for the request is forwarded to the gateway, including supported
+ * image routes such as `gpt-image-2.5-flare` and `gpt-image-2.5-sunburst`.
  *
  * This is a fork of jvm/pi-codex-image-gen (Apache-2.0), retargeted to call
  * a self-hosted gateway with a plain bearer key instead of talking to
@@ -60,7 +60,7 @@ function backoffMs(attempt: number): number {
 const TOOL_PARAMS = Type.Object({
 	prompt: Type.String({ description: "The image prompt. Be specific about subject, composition, style, text, and constraints." }),
 	model: Type.Optional(
-		Type.String({ description: "Gateway model name that should invoke image generation. Defaults to Pi's currently active model." }),
+		Type.String({ description: "Gateway model route for image generation. Pass gpt-image-2.5-flare or gpt-image-2.5-sunburst to use that route; defaults to Pi's active model." }),
 	),
 	outputFormat: Type.Optional(StringEnum(OUTPUT_FORMATS)),
 	save: Type.Optional(StringEnum(SAVE_MODES)),
@@ -365,12 +365,14 @@ export default function litellmCodexImageGen(pi: ExtensionAPI) {
 		name: "codex_generate_image",
 		label: "Gateway Image",
 		description:
-			"Generate an image via the self-hosted LiteLLM gateway's codex image_generation tool (backed by gpt-image-2). " +
+			"Generate an image via the self-hosted LiteLLM gateway's image_generation tool. " +
+			"The model route can be selected with the model parameter, including gpt-image-2.5-flare and gpt-image-2.5-sunburst. " +
 			"Uses this server's own gateway API key; does not require OPENAI_API_KEY or a local ChatGPT login.",
-		promptSnippet: "Generate bitmap images via the gateway's gpt-image-2 image_generation tool.",
+		promptSnippet: "Generate bitmap images via the gateway; use model=gpt-image-2.5-flare or model=gpt-image-2.5-sunburst when requested.",
 		promptGuidelines: [
 			"Use codex_generate_image when the user asks to generate a raster image, illustration, photo, sprite, icon draft, banner, or other bitmap asset.",
 			"Do not use codex_generate_image without a clear image-generation request, because it consumes shared image quota tracked centrally on the gateway.",
+			"When the user requests gpt-image-2.5-flare or gpt-image-2.5-sunburst, pass that exact ID in the model parameter.",
 		],
 		parameters: TOOL_PARAMS,
 		executionMode: "parallel",
@@ -378,17 +380,15 @@ export default function litellmCodexImageGen(pi: ExtensionAPI) {
 			const outputFormat = params.outputFormat || "png";
 			const config = loadConfig(ctx.cwd);
 
-			// Reuse whatever provider/model Pi's chat is currently pointed at,
-			// instead of a separately configured gateway URL/key. ctx.model is
-			// the active model; its baseUrl is the provider's API base, and
-			// getProviderAuth resolves the credential currently in effect for
-			// that provider (API key, stored credential, OAuth, etc).
 			if (!ctx.model) {
 				throw new Error("No active model on this session -- select a model in Pi before using codex_generate_image.");
 			}
 			const gatewayUrl = resolveResponsesUrl(ctx.model.baseUrl);
-			const providerAuth = await ctx.modelRegistry.getProviderAuth(ctx.model.provider);
-			const apiKey = providerAuth?.auth.apiKey;
+			// Reuse whatever provider/model Pi's chat is currently pointed at,
+			// instead of a separately configured gateway URL/key. ctx.model is
+			// the active model; its baseUrl is the provider's API base, and
+			// getApiKeyForProvider resolves the credential for the current provider.
+			const apiKey = await ctx.modelRegistry.getApiKeyForProvider(ctx.model.provider);
 			if (!apiKey) {
 				throw new Error(`No API key resolved for provider "${ctx.model.provider}". Check Pi's model/provider auth setup.`);
 			}
@@ -396,7 +396,7 @@ export default function litellmCodexImageGen(pi: ExtensionAPI) {
 			const sessionId = ctx.sessionManager.getSessionId();
 
 			onUpdate?.({
-				content: [{ type: "text", text: `Requesting gpt-image-2 generation through gateway/${model}...` }],
+				content: [{ type: "text", text: `Requesting image generation through gateway/${model}...` }],
 				details: { gatewayUrl, model, outputFormat },
 			});
 
@@ -417,7 +417,7 @@ export default function litellmCodexImageGen(pi: ExtensionAPI) {
 			}
 
 			const summary = [
-				`Generated image via gateway/${model} using backend gpt-image-2.`,
+				`Generated image via gateway/${model}.`,
 				`Status: ${parsed.image.status}.`,
 				parsed.image.revisedPrompt ? `Revised prompt: ${parsed.image.revisedPrompt}` : undefined,
 				savedPath ? `Saved image to: ${savedPath}` : "Image was not saved to disk.",
@@ -432,7 +432,6 @@ export default function litellmCodexImageGen(pi: ExtensionAPI) {
 				],
 				details: {
 					model,
-					backendImageModel: "gpt-image-2",
 					outputFormat,
 					saveMode: saveConfig.mode,
 					savedPath,

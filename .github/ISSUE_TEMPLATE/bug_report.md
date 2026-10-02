@@ -26,7 +26,7 @@ What happened instead?
 
 ## Environment
 
-- pi-codex-image-gen version or commit:
+- pi-codex-compatible-image-gen version or commit:
 - Pi version:
 - OS:
 - Installation method: npm / git / local path

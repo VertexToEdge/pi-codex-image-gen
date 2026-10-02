@@ -1,7 +1,7 @@
 {
-  "name": "pi-litellm-codex-image-gen",
+  "name": "pi-codex-compatible-image-gen",
   "version": "0.1.0",
-  "description": "Image generation for Pi via a self-hosted LiteLLM gateway in front of codex-proxy (gpt-image-2). Fork of jvm/pi-codex-image-gen, retargeted to call the gateway instead of chatgpt.com directly.",
+  "description": "Image generation for Pi via a self-hosted LiteLLM gateway's Responses API, with selectable gateway model routes.",
   "type": "module",
   "license": "Apache-2.0",
   "pi": {

@@ -2,20 +2,20 @@
 > This repository has moved to [`jvm/pi-mono`](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-image-gen). It is archived and no longer maintained here.
 > Please file issues and pull requests in [`jvm/pi-mono`](https://github.com/jvm/pi-mono).
 
-# pi-codex-image-gen
+# pi-codex-compatible-image-gen
 
-Image generation for [Pi](https://github.com/badlogic/pi-mono) using the ChatGPT Images 2.0 model via the OpenAI Codex Responses backend.
+Image generation for Pi through a self-hosted LiteLLM gateway's Responses API and native image-generation tool.
 
 ## Install
 
 ```sh
-pi install npm:pi-codex-image-gen
+pi install npm:pi-codex-compatible-image-gen
 ```
 
 To uninstall:
 
 ```sh
-pi remove npm:pi-codex-image-gen
+pi remove npm:pi-codex-compatible-image-gen
 ```
 
 ## Quick usage
@@ -26,7 +26,7 @@ In a Pi session:
 > Generate a pixel-art sword icon, 32×32, with a blue blade and gold hilt
 ```
 
-The agent will invoke `codex_generate_image` with your prompt, stream the response from the Codex backend, and save the resulting image to disk. The `model` parameter controls the Codex routing model; image generation is always performed by **gpt-image-2** on the backend.
+The agent invokes `codex_generate_image` with your prompt and saves the returned image. The `model` parameter selects the gateway route; pass `gpt-image-2.5-flare` or `gpt-image-2.5-sunburst` to call either route. When omitted, the active Pi model ID is used.
 
 ## Authentication
 
@@ -52,8 +52,7 @@ Project config overrides global config. Example:
 ```json
 {
   "save": "global",
-  "saveDir": "~/Pictures/generated",
-  "model": "gpt-5.5"
+  "saveDir": "~/Pictures/generated"
 }
 ```
 
@@ -63,7 +62,6 @@ Project config overrides global config. Example:
 | --------- | ------ | ---------- | ---------------------------------------- |
 | `save`    | string | `"global"` | Default save mode (see below).           |
 | `saveDir` | string | —          | Directory used when `save=custom`.       |
-| `model`   | string | `"gpt-5.5"`| Codex routing model. Image generation is always handled by gpt-image-2. |
 
 ### Environment variables
 
@@ -88,16 +86,16 @@ Project config overrides global config. Example:
 | Parameter      | Type   | Required | Description                                                        |
 | -------------- | ------ | -------- | ------------------------------------------------------------------ |
 | `prompt`       | string | ✅        | The image generation prompt.                                       |
-| `model`        | string | —        | Override the Codex model. Defaults to config or `gpt-5.5`.         |
+| `model`        | string | —        | Gateway model route. Use `gpt-image-2.5-flare` or `gpt-image-2.5-sunburst`; defaults to the active Pi model ID. |
 | `outputFormat` | string | —        | `png` (default), `jpeg`, or `webp`.                                |
 | `save`         | string | —        | Override save mode for this call.                                  |
 | `saveDir`      | string | —        | Directory when `save=custom`. Relative paths resolve under CWD.    |
 
 ## How it works
 
-1. Resolves auth via Pi's `openai-codex` provider (ChatGPT session token).
-2. Sends a Codex Responses API request to the routing model (default `gpt-5.5`) with the `image_generation` tool enabled.
-3. The backend invokes **gpt-image-2** to generate the image.
+1. Resolves the active Pi provider's gateway URL and API key.
+2. Sends a streamed Responses API request with the selected model route and `image_generation` tool enabled.
+3. The gateway routes the request to the selected backend model.
 4. Parses the SSE stream for `response.output_item.done` events containing the base64 image.
 5. Saves the image to disk according to the active save mode.
 6. Returns the image data inline plus metadata (model, format, path, revised prompt, usage).

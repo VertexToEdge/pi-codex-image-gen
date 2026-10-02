@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in contributing to `pi-codex-image-gen`.
+Thanks for your interest in `pi-codex-compatible-image-gen`.
 
 ## Development setup
 
@@ -18,7 +18,7 @@ Install this checkout into a temporary Pi project:
 ```bash
 mkdir -p <test-project>
 cd <test-project>
-pi package add -l /path/to/pi-codex-image-gen
+pi package add -l /path/to/pi-codex-compatible-image-gen
 pi
 ```
 
@@ -27,7 +27,7 @@ Then run `/login` for `openai-codex` and ask Pi to generate an image.
 For a one-off run without changing settings:
 
 ```bash
-pi -e /path/to/pi-codex-image-gen/index.ts
+pi -e /path/to/pi-codex-compatible-image-gen/index.ts
 ```
 
 To validate the Python CLI fallback without an API key:
