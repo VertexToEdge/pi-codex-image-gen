@@ -25,10 +25,11 @@
  * this tool automatically follows it -- one place to configure, not two.
  */
 
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { type ExtensionAPI, getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 
@@ -193,10 +194,15 @@ function mimeForFormat(outputFormat: OutputFormat): string {
 async function saveImage(base64Data: string, outputFormat: OutputFormat, outputDir: string, imageCallId: string): Promise<string> {
 	const filename = `${sanitizePathPart(imageCallId, "image_generation")}.${extensionForFormat(outputFormat)}`;
 	const filePath = join(outputDir, filename);
-	await withFileMutationQueue(filePath, async () => {
-		await mkdir(outputDir, { recursive: true });
-		await writeFile(filePath, Buffer.from(base64Data, "base64"));
-	});
+	const tempPath = join(outputDir, `.${filename}.${randomUUID()}.tmp`);
+	await mkdir(outputDir, { recursive: true });
+	try {
+		await writeFile(tempPath, Buffer.from(base64Data, "base64"));
+		await rename(tempPath, filePath);
+	} catch (error) {
+		await rm(tempPath, { force: true }).catch(() => {});
+		throw error;
+	}
 	return filePath;
 }
 
