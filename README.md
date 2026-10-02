@@ -96,9 +96,11 @@ Project config overrides global config. Example:
 1. Resolves the active Pi provider's gateway URL and API key.
 2. Sends a streamed Responses API request with the selected model route and `image_generation` tool enabled.
 3. The gateway routes the request to the selected backend model.
-4. Parses the SSE stream for `response.output_item.done` events containing the base64 image.
+4. Returns as soon as a `response.output_item.done` event contains the base64 image; cancels the remaining stream without waiting for EOF or cancellation acknowledgement.
 5. Saves the image to disk according to the active save mode.
-6. Returns the image data inline plus metadata (model, format, path, revised prompt, usage).
+6. Returns the image data inline plus metadata (model, format, path, revised prompt). Usage is included only if received before image completion.
+
+Gateway requests have a five-minute deadline covering response headers, streaming, and retry backoff. User cancellation also stops the request. `response.completed` or `[DONE]` ends parsing even if the connection stays open; completion without image data is reported as an error.
 
 ## Troubleshooting
 

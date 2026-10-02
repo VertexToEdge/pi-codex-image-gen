@@ -6,6 +6,11 @@ This project follows the spirit of [Keep a Changelog](https://keepachangelog.com
 
 ## [Unreleased]
 
+### Fixed
+
+- Save and return images immediately after receiving their SSE output item, without waiting for gateway EOF or stream cancellation acknowledgement.
+- End parsing on `response.completed` or `[DONE]`; enforce a five-minute gateway deadline, including retries, and interrupt pending stream reads on cancellation.
+
 ### Changed
 
 - Replace an unsupported Pi-only image-save helper with atomic filesystem writes compatible with OMP.

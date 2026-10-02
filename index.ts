@@ -32,11 +32,13 @@ import { isAbsolute, join, resolve } from "node:path";
 import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
+import { setTimeout as delay } from "node:timers/promises";
 
 const CONFIG_FILENAME = "litellm-codex-image-gen.json";
 const DEFAULT_SAVE_MODE = "global";
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
+const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
 const SAVE_MODES = ["none", "project", "global", "custom"] as const;
 type SaveMode = (typeof SAVE_MODES)[number];
@@ -247,35 +249,40 @@ async function parseResponseSse(response: Response, signal?: AbortSignal): Promi
 	const decoder = new TextDecoder();
 	let buffer = "";
 	const parsed: ParsedResponse = { text: [] };
-
+	// Cancellation must not hold up saving an image on a gateway that keeps SSE open.
+	const cancel = () => { void reader.cancel().catch(() => {}); };
+	signal?.addEventListener("abort", cancel, { once: true });
+	const consume = (chunk: string): boolean => {
+		if (chunk.split("\n").some((line) => line.startsWith("data:") && line.slice(5).trim() === "[DONE]")) return true;
+		const data = parseSseDataLines(chunk);
+		if (!data) return false;
+		const event = JSON.parse(data) as SseEvent;
+		handleSseEvent(event, parsed);
+		return Boolean(parsed.image) || event.type === "response.completed";
+	};
 	try {
 		while (true) {
-			if (signal?.aborted) throw new Error("Image generation was aborted.");
+			signal?.throwIfAborted();
 			const { done, value } = await reader.read();
+			signal?.throwIfAborted();
 			if (done) break;
 			buffer += decoder.decode(value, { stream: true });
 
-			let separator = buffer.indexOf("\n\n");
-			while (separator !== -1) {
-				const chunk = buffer.slice(0, separator);
-				buffer = buffer.slice(separator + 2);
-				const data = parseSseDataLines(chunk);
-				if (data) handleSseEvent(JSON.parse(data) as SseEvent, parsed);
-				separator = buffer.indexOf("\n\n");
+			let separator = /\r?\n\r?\n/.exec(buffer);
+			while (separator) {
+				const chunk = buffer.slice(0, separator.index);
+				buffer = buffer.slice(separator.index + separator[0].length);
+				if (consume(chunk)) return parsed;
+				separator = /\r?\n\r?\n/.exec(buffer);
 			}
 		}
-		const remaining = parseSseDataLines(buffer);
-		if (remaining) handleSseEvent(JSON.parse(remaining) as SseEvent, parsed);
+		consume(buffer + decoder.decode());
+		return parsed;
 	} finally {
-		try {
-			await reader.cancel();
-		} catch {
-			// ignored: stream may already be closed
-		}
+		signal?.removeEventListener("abort", cancel);
+		cancel();
 		reader.releaseLock();
 	}
-
-	return parsed;
 }
 
 function handleSseEvent(event: SseEvent, parsed: ParsedResponse): void {
@@ -343,25 +350,34 @@ async function requestImage(
 		"content-type": "application/json",
 	};
 
-	for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
-		if (signal?.aborted) throw new Error("Image generation was aborted.");
-
-		const response = await fetch(gatewayUrl, { method: "POST", headers, body, signal });
-
-		if (!response.ok) {
-			const errorText = await response.text();
-			if (attempt <= MAX_RETRIES && isRetryableStatus(response.status, errorText)) {
-				const delay = backoffMs(attempt);
-				await new Promise<void>((resolve) => setTimeout(resolve, delay));
-				continue;
+	const controller = new AbortController();
+	const abort = () => controller.abort(signal?.reason);
+	if (signal?.aborted) abort();
+	else signal?.addEventListener("abort", abort, { once: true });
+	const timeout = setTimeout(() => controller.abort(new Error("Gateway image generation timed out after 5 minutes.")), REQUEST_TIMEOUT_MS);
+	const requestSignal = controller.signal;
+	try {
+		for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+			requestSignal.throwIfAborted();
+			const response = await fetch(gatewayUrl, { method: "POST", headers, body, signal: requestSignal });
+			if (!response.ok) {
+				const errorText = await response.text();
+				if (attempt <= MAX_RETRIES && isRetryableStatus(response.status, errorText)) {
+					await delay(backoffMs(attempt), undefined, { signal: requestSignal });
+					continue;
+				}
+				throw new Error(`Gateway image generation request failed (${response.status}): ${errorText}`);
 			}
-			throw new Error(`Gateway image generation request failed (${response.status}): ${errorText}`);
+			return await parseResponseSse(response, requestSignal);
 		}
-
-		return parseResponseSse(response, signal);
+		throw new Error("Gateway image generation request failed after all retries.");
+	} catch (error) {
+		if (requestSignal.aborted) throw requestSignal.reason;
+		throw error;
+	} finally {
+		clearTimeout(timeout);
+		signal?.removeEventListener("abort", abort);
 	}
-
-	throw new Error("Gateway image generation request failed after all retries.");
 }
 
 // --- Extension entry point ---
